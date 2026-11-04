@@ -63,3 +63,33 @@ def test_readonly_git_blocks(command: str) -> None:
     result = run_hook("readonly_git.py", {"tool_input": {"command": command}})
     assert result.returncode == 2
     assert "Blocked" in result.stderr
+
+
+def test_ruff_hook_formats_and_fixes(tmp_path: Path) -> None:
+    target = tmp_path / "fixable.py"
+    target.write_text("import os\nx = [1,2,   3]\n")
+
+    result = run_hook("ruff_on_edit.py", {"tool_input": {"file_path": str(target)}})
+
+    assert result.returncode == 0, result.stderr
+    assert target.read_text() == "x = [1, 2, 3]\n"
+
+
+def test_ruff_hook_reports_unfixable_issues(tmp_path: Path) -> None:
+    target = tmp_path / "broken.py"
+    target.write_text("def f():\n    return undefined_name\n")
+
+    result = run_hook("ruff_on_edit.py", {"tool_input": {"file_path": str(target)}})
+
+    assert result.returncode == 2
+    assert "F821" in result.stderr
+
+
+def test_ruff_hook_ignores_non_python_files(tmp_path: Path) -> None:
+    target = tmp_path / "notes.md"
+    target.write_text("import os\n")
+
+    result = run_hook("ruff_on_edit.py", {"tool_input": {"file_path": str(target)}})
+
+    assert result.returncode == 0
+    assert target.read_text() == "import os\n"
