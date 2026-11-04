@@ -1,0 +1,68 @@
+[project]
+name = "keel"
+version = "0.0.1"
+description = "Durable execution runtime for AI agents: survive crashes, resume from the last completed step, never run a side effect twice."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "simonlunay" }]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Framework :: AsyncIO",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "redis>=5.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/keel"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "F",     # pyflakes
+    "I",     # import sorting
+    "B",     # bugbear: likely bugs
+    "UP",    # pyupgrade: modern syntax for 3.11+
+    "SIM",   # simplifications
+    "RUF",   # ruff-specific checks
+    "ASYNC", # async pitfalls, e.g. blocking calls inside async functions
+]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
+python_version = "3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = ["--strict-markers", "-ra"]
+markers = [
+    "integration: needs Postgres and Redis (see docker-compose.yml)",
+]
