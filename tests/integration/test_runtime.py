@@ -1097,3 +1097,180 @@ async def test_step_cancelled_by_the_agent_stops_the_run_as_uncertain(
     run = await fetch_run(conn, run_id)
     assert run["status"] == "running"
     assert run["failure_reason"] is None
+
+
+# --- Design: non-determinism at an uncertain step; raising before logged steps --------
+
+
+def make_charging_agent(
+    counts: Counter[str], *, crash_in_charge: bool, variant: str
+) -> keel.Agent[[], str]:
+    """Plan, charge a card, then email. Variants model code edited after a crash.
+
+    Same qualname for every variant, so each counts as the same agent.
+    """
+
+    @keel.tool(idempotent=True)
+    async def plan() -> str:
+        counts["plan"] += 1
+        return "the plan"
+
+    @keel.tool()
+    async def charge_card(amount: int) -> None:
+        counts["charge_card"] += 1
+        if crash_in_charge:
+            raise SimulatedCrash  # after the side effect, before `completed`
+
+    @keel.tool()
+    async def refund(amount: int) -> None:
+        counts["refund"] += 1
+
+    @keel.agent
+    async def checkout() -> str:
+        await plan()
+        if variant == "renamed":
+            await refund(10)  # step 2 is now a different tool
+        elif variant == "returns_early":
+            return "skipped the charge"
+        elif variant == "raises":
+            raise ValueError("new validation rejects the order")
+        else:
+            await charge_card(10)
+        return "done"
+
+    return checkout
+
+
+CHARGE = "make_charging_agent.<locals>.charge_card"
+
+
+async def crash_inside_charge(runtime: keel.Runtime, run_id: uuid.UUID) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    with pytest.raises(SimulatedCrash):
+        await runtime.run(
+            run_id, make_charging_agent(counts, crash_in_charge=True, variant="original")
+        )
+    return counts
+
+
+async def test_mismatch_at_an_uncertain_step_names_both_in_the_reason(
+    conn: Conn, runtime: keel.Runtime
+) -> None:
+    """Invariant 7 at an uncertain step: the reason names the tool that may have run."""
+    run_id = uuid.uuid4()
+    counts = await crash_inside_charge(runtime, run_id)
+
+    with pytest.raises(keel.NonDeterminismError) as caught:
+        await runtime.run(
+            run_id, make_charging_agent(counts, crash_in_charge=False, variant="renamed")
+        )
+
+    assert counts == {"plan": 1, "charge_card": 1}  # refund never ran
+    reason = (await fetch_run(conn, run_id))["failure_reason"]
+    assert (await fetch_run(conn, run_id))["status"] == "failed"
+    assert "step 2: the log recorded tool" in reason  # the non-determinism...
+    assert f"step 2 (tool '{CHARGE}') is uncertain" in reason  # ...and the uncertain step
+    assert "may have executed" in reason
+    assert str(caught.value) == reason
+
+
+async def test_finishing_before_an_uncertain_step_names_both_in_the_reason(
+    conn: Conn, runtime: keel.Runtime
+) -> None:
+    """Invariant 7 (fewer steps) where the unreached step is uncertain."""
+    run_id = uuid.uuid4()
+    counts = await crash_inside_charge(runtime, run_id)
+
+    with pytest.raises(keel.NonDeterminismError):
+        await runtime.run(
+            run_id, make_charging_agent(counts, crash_in_charge=False, variant="returns_early")
+        )
+
+    reason = (await fetch_run(conn, run_id))["failure_reason"]
+    assert "the agent finished after 1 steps" in reason
+    assert f"step 2 (tool '{CHARGE}') is uncertain" in reason
+
+
+async def test_agent_raising_before_reaching_logged_steps_is_non_determinism(
+    conn: Conn, runtime: keel.Runtime
+) -> None:
+    """Invariant 7: raising before every logged step is reached means the code changed.
+
+    The original exception is attached as the cause. Here step 2 is also uncertain, so
+    the reason names it too.
+    """
+    run_id = uuid.uuid4()
+    counts = await crash_inside_charge(runtime, run_id)
+
+    with pytest.raises(keel.NonDeterminismError) as caught:
+        await runtime.run(
+            run_id, make_charging_agent(counts, crash_in_charge=False, variant="raises")
+        )
+
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert "new validation rejects the order" in str(caught.value.__cause__)
+    run = await fetch_run(conn, run_id)
+    assert run["status"] == "failed"
+    assert "the agent raised ValueError" in run["failure_reason"]
+    assert "after 1 steps, but the log has step 2" in run["failure_reason"]
+    assert f"step 2 (tool '{CHARGE}') is uncertain" in run["failure_reason"]
+    assert counts == {"plan": 1, "charge_card": 1}
+
+
+async def test_agent_raising_with_every_logged_step_reached_is_an_ordinary_failure(
+    conn: Conn, runtime: keel.Runtime
+) -> None:
+    """The other side of Invariant 7: with no unreached steps, a raise is not code drift."""
+    run_id = uuid.uuid4()
+    counts: Counter[str] = Counter()
+    with pytest.raises(ValueError):
+        await runtime.run(
+            run_id, make_charging_agent(counts, crash_in_charge=False, variant="raises")
+        )
+
+    reason = (await fetch_run(conn, run_id))["failure_reason"]
+    assert reason.startswith("agent 'make_charging_agent.<locals>.checkout' raised ValueError")
+
+
+async def test_agent_raising_with_a_step_in_flight_names_that_step(
+    conn: Conn, runtime: keel.Runtime
+) -> None:
+    """Invariants 8 and 9: a step left running when the agent raises must be named.
+
+    asyncio.gather passes up the second call's ConcurrentStepError without cancelling
+    the first step, which may still charge the card after the run has failed.
+    """
+    counts: Counter[str] = Counter()
+    run_id = uuid.uuid4()
+    started, release = asyncio.Event(), asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    @keel.tool()
+    async def charge_card(amount: int) -> None:
+        started.set()
+        await release.wait()
+        counts["charge_card"] += 1
+
+    @keel.tool()
+    async def send_email() -> None:
+        counts["send_email"] += 1
+
+    @keel.agent
+    async def agent() -> None:
+        charge = asyncio.create_task(charge_card(10))
+        tasks.append(charge)
+        await started.wait()
+        await asyncio.gather(charge, send_email())
+
+    with pytest.raises(keel.ConcurrentStepError, match="still in flight") as caught:
+        await runtime.run(run_id, agent)
+
+    assert isinstance(caught.value.__cause__, keel.ConcurrentStepError)
+    run = await fetch_run(conn, run_id)
+    assert run["status"] == "failed"
+    assert "step 1 (tool" in run["failure_reason"]
+    assert "charge_card" in run["failure_reason"]
+    assert counts["send_email"] == 0
+
+    release.set()
+    await tasks[0]

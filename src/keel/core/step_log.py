@@ -170,3 +170,20 @@ class StepLog:
         )
         row = await cursor.fetchone()
         return bool(row and row[0])
+
+    async def started_steps_from(
+        self, run_id: UUID, step_number: int
+    ) -> list[tuple[int, str, str]]:
+        """``(step_number, kind, name)`` of uncertain steps numbered ``step_number`` or up.
+
+        An uncertain step is ``started`` but never ``completed``: it may have executed.
+        """
+        cursor = await self._conn.execute(
+            """
+            SELECT step_number, kind, name FROM steps
+            WHERE run_id = %s AND step_number >= %s AND status = 'started'
+            ORDER BY step_number
+            """,
+            (run_id, step_number),
+        )
+        return [(n, kind, name) for n, kind, name in await cursor.fetchall()]

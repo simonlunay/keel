@@ -159,6 +159,25 @@ class Runtime:
                 if isinstance(exc, UncertainStepError):
                     raise
                 raise UncertainStepError(str(replayer.stop_error)) from exc
+            if replayer.step_in_flight and not run.is_terminal:
+                # The agent raised while a task it spawned is still inside a step, most
+                # often asyncio.gather passing up a ConcurrentStepError without
+                # cancelling the step already running. Same handling as the return path
+                # below: that step may still have its side effect, so name it in the
+                # reason, which is the only record pointing a human at it.
+                in_flight = replayer.current_step or "a step"
+                reason = (
+                    f"agent {agent.name!r} raised {exc!r} while {in_flight} was still in flight"
+                )
+                await self._runs.fail(run_id, reason)
+                raise ConcurrentStepError(reason) from exc
+            if replayer.stop_error is None:
+                # The agent's own code raised. If the log holds steps it never reached,
+                # the original run got past this point without raising, so the code
+                # changed (Invariant 7): fail with a non-determinism error caused by
+                # exc. (If replay already stopped, e.g. a step failed, that error is
+                # the real cause and the log check would only obscure it.)
+                await replayer.check_all_steps_reached(raised=exc)
             # Errors are permanent in this slice. Agent code raised (or a step did,
             # which has already failed the run with a more specific reason; fail() is
             # then a no-op). Terminal runs are left untouched by fail() either way.

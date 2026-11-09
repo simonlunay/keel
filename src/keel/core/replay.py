@@ -150,12 +150,14 @@ class Replayer:
             if (record.kind, record.name) != (kind, name):
                 await self._non_determinism(
                     f"step {step_number}: the log recorded {record.kind} {record.name!r}, "
-                    f"but the code called {kind} {name!r}"
+                    f"but the code called {kind} {name!r}",
+                    from_step=step_number,
                 )
             if record.input_hash != hash_:
                 await self._non_determinism(
                     f"step {step_number}: {kind} {name!r} was called with different input "
-                    "than the log recorded"
+                    "than the log recorded",
+                    from_step=step_number,
                 )
             if record.status == "completed":
                 # Normalised exactly as the live result was, because JSONB doesn't keep
@@ -243,21 +245,41 @@ class Replayer:
         self.close(RunTerminalError(reason))
         await self._step_log.fail(self._run_id, step_number, reason)
 
-    async def check_all_steps_reached(self) -> None:
-        """After the agent returns: fail if the log holds steps the agent never reached.
+    async def check_all_steps_reached(self, *, raised: Exception | None = None) -> None:
+        """Fail if the log holds steps the agent never reached (Invariant 7).
 
-        Fewer steps on replay means the code changed (Invariant 7). Checked against the
-        database rather than a count kept in memory, so it sees every logged step,
-        including an uncertain one left by a crash.
+        Called when the agent returns, and when it raises (``raised``). Either way, the
+        original run got past this point, so the code has changed. A raised exception
+        becomes the non-determinism error's ``__cause__``. Checked against the database
+        rather than a count kept in memory, so it sees every logged step, including an
+        uncertain one left by a crash.
         """
-        if await self._step_log.has_step_from(self._run_id, self._next_step_number):
-            await self._non_determinism(
-                f"the agent finished after {self._next_step_number - 1} steps, but the "
-                f"log has step {self._next_step_number} or later"
-            )
+        reached = self._next_step_number - 1
+        if not await self._step_log.has_step_from(self._run_id, reached + 1):
+            return
+        ended = "finished" if raised is None else f"raised {raised!r}"
+        await self._non_determinism(
+            f"the agent {ended} after {reached} steps, but the log has step {reached + 1} or later",
+            from_step=reached + 1,
+            cause=raised,
+        )
 
-    async def _non_determinism(self, detail: str) -> NoReturn:
+    async def _non_determinism(
+        self, detail: str, *, from_step: int, cause: Exception | None = None
+    ) -> NoReturn:
+        """Fail the run (unless terminal) and raise ``NonDeterminismError``.
+
+        ``from_step`` is where the code and the log diverge. Any uncertain step at or
+        after it is named in the reason (design: "Non-determinism at an uncertain
+        step"): the run can never resume past it now, so the reason is the only record
+        telling a human that a side effect may have happened and needs checking.
+        """
         reason = f"non-determinism in run {self._run_id}: {detail}"
+        for number, kind, name in await self._step_log.started_steps_from(self._run_id, from_step):
+            reason += (
+                f"; step {number} ({kind} {name!r}) is uncertain: it was started but never "
+                "completed and may have executed"
+            )
         # A terminal run keeps its status: replaying it with changed code shouldn't
         # rewrite the history of a run that already finished. RunStore.fail is a no-op
         # unless the run is running anyway; the check just makes the intent explicit.
@@ -265,7 +287,7 @@ class Replayer:
         self.close(error)
         if self._terminal_status is None:
             await self._runs.fail(self._run_id, reason)
-        raise error
+        raise error from cause
 
     def _uncertain(self, step_number: int) -> NoReturn:
         reason = (
