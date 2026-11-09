@@ -53,6 +53,7 @@ class Replayer:
         self._terminal_status: str | None = run.status if run.is_terminal else None
         self._next_step_number = 1
         self._in_flight = False
+        self._current_step: str | None = None
         self._stop_error: KeelError | None = None
         self._finished = False
 
@@ -66,6 +67,16 @@ class Replayer:
         ``except`` in an agent can't turn a stopped run into an apparent success.
         """
         return self._stop_error
+
+    @property
+    def step_in_flight(self) -> bool:
+        """Whether a step call has started and not yet returned."""
+        return self._in_flight
+
+    @property
+    def current_step(self) -> str | None:
+        """The step in flight, e.g. ``"step 3 (tool 'send_email')"``, if known."""
+        return self._current_step
 
     @property
     def hit_uncertain_step(self) -> bool:
@@ -103,8 +114,27 @@ class Replayer:
         self._in_flight = True
         try:
             return await self._step(kind, name, input, execute)
+        except BaseException as exc:
+            # Exceptions (step errors, non-determinism, ...) already closed the replayer
+            # where they were raised. A BaseException, typically CancelledError from
+            # the agent's own asyncio.wait_for timing out, interrupts the step like a
+            # crash would: its `started` record may or may not have been committed,
+            # and its side effect may or may not have happened. Treat it the same way
+            # as a crash: stop this run here and leave it running for uncertain step
+            # handling. Without this, the agent could catch the timeout and carry on,
+            # completing the run past an uncertain step, or (if the cancel landed
+            # before `started` committed) leaving a gap in step numbers (Invariant 6).
+            if not isinstance(exc, Exception):
+                self.close(
+                    UncertainStepError(
+                        f"run {self._run_id}: {self._current_step or 'a step'} was "
+                        f"interrupted ({type(exc).__name__}) and may have started"
+                    )
+                )
+            raise
         finally:
             self._in_flight = False
+            self._current_step = None
 
     async def _step(self, kind: StepKind, name: str, input: Any, execute: Execute) -> Any:
         # Serialise the input before taking a step number or writing anything, so bad
@@ -113,6 +143,7 @@ class Replayer:
         hash_ = input_hash(input)
         step_number = self._next_step_number
         self._next_step_number += 1
+        self._current_step = f"step {step_number} ({kind} {name!r})"
 
         record = await self._step_log.get(self._run_id, step_number)
         if record is not None:
@@ -191,7 +222,7 @@ class Replayer:
         # i.e. uncertain. That window is inherent; the design handles it via uncertain
         # step detection rather than trying to close it.
         try:
-            await self._step_log.complete(self._run_id, step_number, result)
+            stored = await self._step_log.complete(self._run_id, step_number, result)
         except BaseException:
             # The step executed but its completion wasn't recorded, so it is uncertain.
             # Stop here: continuing would let the run reach `completed` with a step
@@ -203,7 +234,8 @@ class Replayer:
                 )
             )
             raise
-        return result
+        # The stored value, normalised exactly as a replay would return it.
+        return to_json(stored)
 
     async def _fail(self, step_number: int, reason: str) -> None:
         # Close *before* the write: if the write itself fails (database unreachable),

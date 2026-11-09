@@ -82,17 +82,25 @@ class RunStore:
             (run_id,),
         )
 
-    async def complete(self, run_id: UUID, result: Any) -> None:
-        """``running`` -> ``completed`` with the agent's final result."""
+    async def complete(self, run_id: UUID, result: Any) -> Any:
+        """``running`` -> ``completed`` with the agent's final result.
+
+        Returns the result as Postgres stored it (``RETURNING``), so the first call and
+        a later replay of the completed run return the same value. See
+        ``StepLog.complete`` for why JSONB can change numbers.
+        """
         cursor = await self._conn.execute(
             """
             UPDATE runs SET status = 'completed', result = %s, updated_at = now()
             WHERE id = %s AND status = 'running'
+            RETURNING result
             """,
             (Jsonb(result), run_id),
         )
-        if cursor.rowcount != 1:
+        row = await cursor.fetchone()
+        if row is None:
             raise RuntimeError(f"run {run_id} was not running when it completed")
+        return row[0]
 
     async def fail(self, run_id: UUID, reason: str) -> None:
         """``running`` -> ``failed``. A no-op if the run is no longer ``running``.

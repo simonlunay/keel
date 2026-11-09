@@ -103,3 +103,8 @@ def test_input_hash_is_stable_across_key_order_and_canonicalization() -> None:
     assert input_hash(live) == input_hash(replayed) == input_hash(dict(reversed(live.items())))
     assert input_hash({"a": 1}) != input_hash({"a": 2})
     assert len(input_hash({})) == 64  # sha256 hex
+
+
+def test_to_json_rejects_unpaired_surrogates_which_postgres_cannot_encode() -> None:
+    with pytest.raises(ValueError):
+        to_json({"k": chr(0xD800)})

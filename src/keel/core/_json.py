@@ -18,7 +18,8 @@ def to_json(value: Any) -> Any:
     Canonical form: dict keys sorted, tuples as lists.
 
     Raises ``TypeError`` for values JSON can't represent, and ``ValueError`` for NaN,
-    infinities, and NUL characters in strings, which Postgres JSONB rejects.
+    infinities, NUL characters, and unpaired surrogates in strings, which Postgres
+    JSONB rejects (``UnicodeEncodeError`` is a ``ValueError``).
     """
     # Two passes. The first turns non-string dict keys into strings (as JSONB will);
     # the second sorts the *string* keys. Sorting in a single pass would sort the
@@ -37,6 +38,9 @@ def _reject_nul(value: Any) -> None:
     if isinstance(value, str):
         if "\x00" in value:
             raise ValueError("Postgres JSONB cannot store NUL (\\u0000) in strings")
+        # Lone surrogates survive json.dumps but can't be encoded as UTF-8 for
+        # Postgres; catch them here, before a step executes or completes.
+        value.encode("utf-8")
     elif isinstance(value, dict):
         for key, item in value.items():
             _reject_nul(key)

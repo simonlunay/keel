@@ -4,6 +4,7 @@ Each test names the invariant (docs/design.md, "Invariants") or design rule it c
 """
 
 import asyncio
+import contextlib
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
@@ -902,3 +903,197 @@ async def test_run_already_executing_in_this_process_is_refused(
     # Once the first call has finished, the run can be called again (here: a replay).
     assert await runtime.run(run_id, agent) == "done"
     assert counts["slow"] == 1
+
+
+# --- Regressions from the design-update review --------------------------------------
+
+
+async def test_numbers_jsonb_rewrites_replay_with_the_same_input_hash(
+    conn: Conn, runtime: keel.Runtime
+) -> None:
+    """Invariant 7 without false positives: JSONB's numeric changes 1e16 and -0.0.
+
+    Live code must see the value Postgres stored (an int, and 0.0), as replay does, or
+    the next step's input hashes differently and a correct run fails as non-deterministic.
+    """
+    counts: Counter[str] = Counter()
+    seen: list[Any] = []
+    run_id = uuid.uuid4()
+
+    @keel.tool(idempotent=True)
+    async def totals() -> dict[str, float]:
+        return {"big": 1e16, "neg_zero": -0.0}
+
+    @keel.tool()
+    async def report(values: dict[str, Any]) -> None:
+        counts["report"] += 1
+
+    def make(crash: bool) -> keel.Agent[[], None]:
+        @keel.agent
+        async def reporter() -> None:
+            values = await totals()
+            seen.append(values)
+            if crash:
+                raise SimulatedCrash
+            await report(values)
+
+        return reporter
+
+    with pytest.raises(SimulatedCrash):
+        await runtime.run(run_id, make(crash=True))
+    await runtime.run(run_id, make(crash=False))
+
+    assert counts["report"] == 1
+    live, replayed = seen
+    assert live == replayed
+    assert repr(live) == repr(replayed)  # same types too: int, not float; 0.0, not -0.0
+
+
+async def test_agent_returning_with_a_step_in_flight_fails_the_run(
+    conn: Conn, runtime: keel.Runtime
+) -> None:
+    """Invariant 9 / one step at a time: a run can't complete while a step still runs."""
+    run_id = uuid.uuid4()
+    started, release = asyncio.Event(), asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    @keel.tool()
+    async def slow() -> None:
+        started.set()
+        await release.wait()
+
+    @keel.agent
+    async def agent() -> str:
+        tasks.append(asyncio.create_task(slow()))
+        await started.wait()
+        return "done too early"
+
+    with pytest.raises(keel.ConcurrentStepError, match="still in flight"):
+        await runtime.run(run_id, agent)
+
+    run = await fetch_run(conn, run_id)
+    assert run["status"] == "failed"
+    assert run["result"] is None
+    # The reason names the step, because it may still run and a human may need to check.
+    assert "step 1 (tool" in run["failure_reason"]
+    assert "slow" in run["failure_reason"]
+
+    # The stray step had already started, so it finishes, and the log records what
+    # actually happened: completed, inside a failed run. No new step can start.
+    release.set()
+    await tasks[0]
+    assert [s["status"] for s in await fetch_steps(conn, run_id)] == ["completed"]
+    assert (await fetch_run(conn, run_id))["status"] == "failed"
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "crash", "cancel"])
+async def test_executing_guard_is_released_when_run_exits_abnormally(
+    conn: Conn, runtime: keel.Runtime, failure: str
+) -> None:
+    """Invariant 9's guard must not leave a run locked after an error or cancellation."""
+    run_id = uuid.uuid4()
+    started = asyncio.Event()
+    crash = True
+
+    @keel.tool()
+    async def step() -> None:
+        started.set()
+        if failure == "cancel" and crash:
+            await asyncio.Event().wait()  # blocks until cancelled
+
+    @keel.agent
+    async def agent(label: str) -> str:
+        await step()
+        if failure == "crash" and crash:
+            raise SimulatedCrash
+        return label
+
+    if failure == "mismatch":
+        await runtime.run(run_id, agent, "a")
+        with pytest.raises(keel.RunMismatchError):
+            await runtime.run(run_id, agent, "b")
+    elif failure == "crash":
+        with pytest.raises(SimulatedCrash):
+            await runtime.run(run_id, agent, "a")
+    else:
+        task = asyncio.create_task(runtime.run(run_id, agent, "a"))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    crash = False
+
+    # Not refused with RunAlreadyExecutingError. (After a cancel mid-step, the step is
+    # uncertain, which is the expected outcome of resuming that run.)
+    if failure == "cancel":
+        with pytest.raises(keel.UncertainStepError):
+            await runtime.run(run_id, agent, "a")
+    else:
+        assert await runtime.run(run_id, agent, "a") == "a"
+
+
+async def test_stop_error_takes_precedence_over_the_fewer_steps_check(
+    conn: Conn, runtime: keel.Runtime
+) -> None:
+    """Invariant 7: the first non-determinism found is the one reported and recorded."""
+    rec = Recorder()
+    run_id = uuid.uuid4()
+    with pytest.raises(SimulatedCrash):
+        await runtime.run(run_id, make_agent(rec, crash_after_search=True), "durable agents")
+    changed = make_agent(rec, rename_search=True)
+
+    @keel.agent
+    async def research_agent(topic: str) -> str:
+        try:
+            return await changed.fn(topic)
+        except keel.NonDeterminismError:
+            return "swallowed"  # returns after 1 step, so the log's step 2 is unreached
+
+    research_agent.name = changed.name
+
+    with pytest.raises(keel.NonDeterminismError, match="step 2: the log recorded"):
+        await runtime.run(run_id, research_agent, "durable agents")
+
+    reason = (await fetch_run(conn, run_id))["failure_reason"]
+    assert "step 2: the log recorded" in reason
+    assert "finished after" not in reason
+
+
+async def test_step_cancelled_by_the_agent_stops_the_run_as_uncertain(
+    conn: Conn, runtime: keel.Runtime
+) -> None:
+    """Invariants 2 and 6: a timed-out step can't be skipped past.
+
+    The agent wraps a non-idempotent tool in asyncio.wait_for, catches the timeout, and
+    tries to carry on. The step may have had its side effect, so the run must not
+    continue or complete; it is left running with the step started, as after a crash.
+    """
+    counts: Counter[str] = Counter()
+    run_id = uuid.uuid4()
+
+    @keel.tool()
+    async def send_email() -> None:
+        counts["send_email"] += 1
+        await asyncio.Event().wait()  # hangs until cancelled
+
+    @keel.tool()
+    async def next_step() -> None:
+        counts["next_step"] += 1
+
+    @keel.agent
+    async def agent() -> str:
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(send_email(), timeout=0.05)
+        await next_step()
+        return "done"
+
+    with pytest.raises(keel.UncertainStepError, match="step 1"):
+        await runtime.run(run_id, agent)
+
+    assert counts == {"send_email": 1}
+    assert [(s["step_number"], s["status"]) for s in await fetch_steps(conn, run_id)] == [
+        (1, "started")
+    ]
+    run = await fetch_run(conn, run_id)
+    assert run["status"] == "running"
+    assert run["failure_reason"] is None

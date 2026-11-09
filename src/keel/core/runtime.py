@@ -16,6 +16,7 @@ from psycopg import AsyncConnection
 
 from keel.core._json import to_json
 from keel.core.errors import (
+    ConcurrentStepError,
     NoActiveRunError,
     RunAlreadyExecutingError,
     RunMismatchError,
@@ -178,6 +179,20 @@ class Runtime:
             # The run did not succeed, terminal or not: report the original error.
             raise replayer.stop_error
 
+        if replayer.step_in_flight and not run.is_terminal:
+            # The agent returned while a task it spawned is still inside a step. Steps
+            # run one at a time and belong to the agent's own flow (design: Programming
+            # model), so this is an agent bug. Completing now would leave a completed
+            # run with a step still running, and release the one-executor guard while
+            # it runs (Invariant 9). Fail the run instead: the database check in
+            # StepLog.start then refuses the stray step if it hasn't started yet.
+            # Name the step: it may still execute, so a human may need to check
+            # whether its side effect happened.
+            in_flight = replayer.current_step or "a step"
+            reason = f"agent {agent.name!r} returned while {in_flight} was still in flight"
+            await self._runs.fail(run_id, reason)
+            raise ConcurrentStepError(reason)
+
         # Fewer steps than the log: the code changed (Invariant 7). Fails a running run;
         # a terminal run raises but keeps its status, as with any non-determinism.
         await replayer.check_all_steps_reached()
@@ -193,5 +208,5 @@ class Runtime:
 
         # Crash between the last step completing and this commit: the run stays
         # running, and resuming replays every step and lands here again.
-        await self._runs.complete(run_id, result)
-        return result  # type: ignore[no-any-return]
+        stored = await self._runs.complete(run_id, result)
+        return to_json(stored)  # type: ignore[no-any-return]

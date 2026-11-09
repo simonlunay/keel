@@ -115,17 +115,27 @@ class StepLog:
         )
         return key if cursor.rowcount == 1 else None
 
-    async def complete(self, run_id: UUID, step_number: int, result: Any) -> None:
-        """``started`` -> ``completed`` with the step's result."""
+    async def complete(self, run_id: UUID, step_number: int, result: Any) -> Any:
+        """``started`` -> ``completed`` with the step's result.
+
+        Returns the result *as Postgres stored it*, read back with ``RETURNING``. JSONB
+        stores numbers as ``numeric``, which doesn't keep Python's float formatting
+        (``1e16`` comes back as the int ``10000000000000000``, ``-0.0`` as ``0.0``).
+        Handing the agent the stored value means the live path and the replay path
+        see the same value, so inputs built from it hash the same (Invariant 7).
+        """
         cursor = await self._conn.execute(
             """
             UPDATE steps SET status = 'completed', result = %s, completed_at = now()
             WHERE run_id = %s AND step_number = %s AND status = 'started'
+            RETURNING result
             """,
             (Jsonb(result), run_id, step_number),
         )
-        if cursor.rowcount != 1:
+        row = await cursor.fetchone()
+        if row is None:
             raise RuntimeError(f"step {step_number} of run {run_id} was not started")
+        return row[0]
 
     async def fail(self, run_id: UUID, step_number: int, reason: str) -> None:
         """Mark the step ``failed`` and its run ``failed``, atomically.
