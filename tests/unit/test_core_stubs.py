@@ -1,11 +1,9 @@
 import pytest
 
-from keel.core.replay import Replayer
-from keel.core.step_log import StepLog
 from keel.core.worker import Worker
 
 
-@pytest.mark.parametrize("stub", [StepLog, Replayer, Worker])
-def test_core_stubs_are_not_implemented(stub: type) -> None:
+def test_worker_stub_is_not_implemented() -> None:
+    # Workers (leases, heartbeats) are milestone 2.
     with pytest.raises(NotImplementedError):
-        stub()
+        Worker()

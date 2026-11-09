@@ -22,7 +22,10 @@ uv run mypy                      # type check (strict)
 
 ## Layout
 
-- `src/keel/core/`: the runtime (step log, replay, worker). Stubs only until designed.
+- `src/keel/core/`: the runtime: step log, runs, replay, run lifecycle (`runtime.py`).
+  `worker.py` is still a stub (milestone 2).
+- `src/keel/_api.py`: the public programming model (`@keel.tool`, `@keel.agent`, `keel.llm`).
+- `src/keel/migrations/`: SQL applied by `keel.migrate(conn)`.
 - `src/keel/testing/`: test helpers, including `MockLLM`. Not the runtime's LLM interface.
 - `tests/unit/`: fast, no services. `tests/integration/`: need Postgres/Redis, marked
   `integration`.
